@@ -1,58 +1,64 @@
-name: flask-helloworld
 on:
-  workflow_dispatch:
-    inputs:
-      anhquy:
-        description: 'test deployment'
-        default: 'master'
-        required: true
-      pro:
-        description: 'test deployment'
-        default: 'yes'
-        required: true
+  push:
+    branches:
+      - master
+
+name: Deploy
 
 jobs:
-    docker:
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v2  
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
 
-            - name: Login docker Hub
-              uses: docker/login-action@v1
-              with:
-                username: ${{ secrets.DOCKERHUB_USERNAME }} 
-                password: ${{ secrets.DOCKERHUB_ASSEST_TOKEN }} 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
 
-            - name: Setup Docker Buildx
-              uses: docker/setup-buildx-action@v1
-              id: Buildx
+      - name: Validate composer
+        run: |
+          composer validate
+      
+      - name: Install dependencies
+        run: |
+          composer install --optimize-autoloader --prefer-dist --no-progress --no-suggest
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
 
-            - name: Build an Push Docker Image
-              uses: docker/setup-buildx-action@v1
-              id: bulldx
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
 
-            - name: Build and Push Docker Image
-              uses: docker/build-push-action@v2
+      - name: Get AWS ECR credentials
+        id: ecr-credentials
+        run: |
+          echo "::set-output name=username::AWS"
+          echo "::set-output name=password::`aws ecr get-login-password`"
+      - name: Docker build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/conference:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/conference:$IMAGE_TAG
+      - name: Download task def
+        run: |
+          aws ecs describe-task-definition --task-definition conference --query taskDefinition > task-definition.json
+      - name: Render Amazon ECS task definition for container
+        id: render-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: conference
+          image: ${{ steps.login-ecr.outputs.registry }}/conference:${{ github.sha }}
 
-            - name: Build an Push Docker Image
-              uses: docker/build-push-action@v2
-              id: docker_build
-              with:
-                context: ./
-                file: ./Dockerfile
-                builder: ${{steps.buildx.outputs.name}}
-                push: true
-                tags: ${{ secrets.DOCKERHUB_USERNAME }}/nodejs
-            - name: Verify
-              run: echo ${{ steps.docker_build.outputs.digest }}
-            - name: SSH deploy
-              uses: appleboy/ssh-action@master
-              with:
-                host: ${{ secrets.SSH_HOST }}
-                username: ${{ secrets.SSH_USER }}
-                key: ${{ secrets.SSH_PRIVATE_KEY }}
-                script: |
-                  whoami
-                  ls -al
-                  ./deploy.sh
+      - name: Deploy to Amazon ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-container.outputs.task-definition }}
+          service: conference
+          cluster: conference
+          wait-for-service-stability: true
